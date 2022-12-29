@@ -71,7 +71,9 @@ def main(args):
     train_loader = torch.utils.data.DataLoader(train_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
     valid_set = PDB_dataset(list(valid.keys()), loader_pdb, valid, params)
     valid_loader = torch.utils.data.DataLoader(valid_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
-
+    
+    print(args.hidden_dim, args.num_encoder_layers, args.num_neighbors, args.dropout, args.backbone_noise)
+    raise NotImplementedError
 
     model = ProteinMPNN(node_features=args.hidden_dim, 
                         edge_features=args.hidden_dim, 

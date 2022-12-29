@@ -429,6 +429,8 @@ class ProteinMPNN(nn.Module):
     def forward(self, X, S, mask, chain_M, residue_idx, chain_encoding_all):
         """ Graph-conditioned sequence model """
         device=X.device
+        print(X.shape)
+        raise NotImplementedError
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
