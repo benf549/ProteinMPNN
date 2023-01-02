@@ -60,15 +60,19 @@ def featurize(batch, device):
         c = 1
         l0 = 0
         l1 = 0
+        
         for step, letter in enumerate(all_chains):
             if letter in visible_chains:
                 chain_seq = b[f'seq_chain_{letter}']
                 chain_length = len(chain_seq)
                 chain_coords = b[f'coords_chain_{letter}'] #this is a dictionary
-                chain_mask = np.zeros(chain_length) #0.0 for visible chains
+                # A visible chain is all zeros, a hidden/masked chain is all 1's; store this in chain_mask_list in same order as coords are stored in x_chain_list
+                chain_mask = np.zeros(chain_length) 
+                # rows of X matrix that will be added for this chain.
                 x_chain = np.stack([chain_coords[c] for c in [f'N_chain_{letter}', f'CA_chain_{letter}', f'C_chain_{letter}', f'O_chain_{letter}']], 1) #[chain_length,4,3]
                 x_chain_list.append(x_chain)
                 chain_mask_list.append(chain_mask)
+                # Store the sequence (labels) in the same order as the chain list and mask
                 chain_seq_list.append(chain_seq)
                 chain_encoding_list.append(c*np.ones(np.array(chain_mask).shape[0]))
                 l1 += chain_length
@@ -77,10 +81,11 @@ def featurize(batch, device):
                 l0 += chain_length
                 c+=1
             elif letter in masked_chains: 
+                # The mask is set to 1s signalling ignoring these chains while constructing everything else the same way as for the unmasked chains (duplicated code)
                 chain_seq = b[f'seq_chain_{letter}']
                 chain_length = len(chain_seq)
                 chain_coords = b[f'coords_chain_{letter}'] #this is a dictionary
-                chain_mask = np.ones(chain_length) #0.0 for visible chains
+                chain_mask = np.ones(chain_length) # 0.0 for visible chains, 1.0 for hidden/masked chains
                 x_chain = np.stack([chain_coords[c] for c in [f'N_chain_{letter}', f'CA_chain_{letter}', f'C_chain_{letter}', f'O_chain_{letter}']], 1) #[chain_lenght,4,3]
                 x_chain_list.append(x_chain)
                 chain_mask_list.append(chain_mask)
@@ -91,6 +96,8 @@ def featurize(batch, device):
                 residue_idx[i, l0:l1] = 100*(c-1)+np.arange(l0, l1)
                 l0 += chain_length
                 c+=1
+                
+        # Merge all of the coordinate frames into one large x matrix for the current protein, also merge sequence (labels) and mask lists.
         x = np.concatenate(x_chain_list,0) #[L, 4, 3]
         all_sequence = "".join(chain_seq_list)
         m = np.concatenate(chain_mask_list,0) #[L,], 1.0 for places that need to be predicted
@@ -110,6 +117,7 @@ def featurize(batch, device):
         indices = np.asarray([alphabet.index(a) for a in all_sequence], dtype=np.int32)
         S[i, :l] = indices
 
+    # Convert NaN in X to zeros and keep track of which positions are not NaN/inf in mask.
     isnan = np.isnan(X)
     mask = np.isfinite(np.sum(X,(2,3))).astype(np.float32)
     X[isnan] = 0.
