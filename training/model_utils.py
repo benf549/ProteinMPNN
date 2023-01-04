@@ -61,6 +61,7 @@ def featurize(batch, device):
         l0 = 0
         l1 = 0
         
+        # Loop over the chains in this protein training example. Not all chains are visible during training (I think to allow limiting sequence similarity)
         for step, letter in enumerate(all_chains):
             if letter in visible_chains:
                 chain_seq = b[f'seq_chain_{letter}']
@@ -104,8 +105,10 @@ def featurize(batch, device):
         chain_encoding = np.concatenate(chain_encoding_list,0)
 
         l = len(all_sequence)
-        x_pad = np.pad(x, [[0,L_max-l], [0,0], [0,0]], 'constant', constant_values=(np.nan, ))
-        X[i,:,:,:] = x_pad
+        # Pad the coordinate matrix up to the length of the longest protein with NaN which is used to construct the `mask` matrix
+        x_pad = np.pad(x, [[0,L_max-l], [0,0], [0,0]], 'constant', constant_values=(np.nan, )) 
+        # Build up coordinate matrix by adding padded coords for this protein example in the loop over the batch.
+        X[i,:,:,:] = x_pad 
 
         m_pad = np.pad(m, [[0,L_max-l]], 'constant', constant_values=(0.0, ))
         chain_M[i,:] = m_pad
@@ -113,11 +116,11 @@ def featurize(batch, device):
         chain_encoding_pad = np.pad(chain_encoding, [[0,L_max-l]], 'constant', constant_values=(0.0, ))
         chain_encoding_all[i,:] = chain_encoding_pad
 
-        # Convert to labels
+        # Converts sequence to labels
         indices = np.asarray([alphabet.index(a) for a in all_sequence], dtype=np.int32)
         S[i, :l] = indices
 
-    # Convert NaN in X to zeros and keep track of which positions are not NaN/inf in mask.
+    # Convert introduced NaNs in X to zeros and keep track of which positions are not NaN/inf in mask.
     isnan = np.isnan(X)
     mask = np.isfinite(np.sum(X,(2,3))).astype(np.float32)
     X[isnan] = 0.
@@ -166,6 +169,8 @@ def gather_edges(edges, neighbor_idx):
     return edge_features
 
 def gather_nodes(nodes, neighbor_idx):
+    # Presumably (sum) aggregates neigbors by 
+    
     # Features [B,N,C] at Neighbor indices [B,N,K] => [B,N,K,C]
     # Flatten and expand indices per batch [B,N,K] => [B,NK] => [B,NK,C]
     neighbors_flat = neighbor_idx.view((neighbor_idx.shape[0], -1))
@@ -289,6 +294,10 @@ class PositionWiseFeedForward(nn.Module):
         return h
 
 class PositionalEncodings(nn.Module):
+    """
+    For relative positional encoding we used AlphaFold-like (10) discrete (one-hot encoded) tokens -32, -31,..., 31, 32 
+    within the protein chains and additional token 33 if residues are in different chains. Ablating positional encodings showed almost the same performance...
+    """
     def __init__(self, num_embeddings, max_relative_feature=32):
         super(PositionalEncodings, self).__init__()
         self.num_embeddings = num_embeddings
@@ -296,6 +305,7 @@ class PositionalEncodings(nn.Module):
         self.linear = nn.Linear(2*max_relative_feature+1+1, num_embeddings)
 
     def forward(self, offset, mask):
+        # Encode the position of the neighbors in a +/- 32 by 32 bin OHE
         d = torch.clip(offset + self.max_relative_feature, 0, 2*self.max_relative_feature)*mask + (1-mask)*(2*self.max_relative_feature+1)
         d_onehot = torch.nn.functional.one_hot(d, 2*self.max_relative_feature+1+1)
         E = self.linear(d_onehot.float())
@@ -437,8 +447,6 @@ class ProteinMPNN(nn.Module):
     def forward(self, X, S, mask, chain_M, residue_idx, chain_encoding_all):
         """ Graph-conditioned sequence model """
         device=X.device
-        print(X.shape)
-        raise NotImplementedError
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
         h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
@@ -447,6 +455,11 @@ class ProteinMPNN(nn.Module):
         # Encoder is unmasked self-attention
         mask_attend = gather_nodes(mask.unsqueeze(-1),  E_idx).squeeze(-1)
         mask_attend = mask.unsqueeze(-1) * mask_attend
+        
+        print(mask_attend.shape)
+        print(mask_attend)
+        
+        # Apply encoder layers with checkpointing.
         for layer in self.encoder_layers:
             h_V, h_E = torch.utils.checkpoint.checkpoint(layer, h_V, h_E, E_idx, mask, mask_attend)
 
