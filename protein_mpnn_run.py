@@ -1,7 +1,11 @@
+#!/usr/bin/env python3
 import argparse
 import os.path
 
 def main(args):
+    """
+    Runs with ./protein_mpnn_run.py --path_to_model_weights vanilla_model_weights/ --out_folder . --pdb_path ~/1stp/1stp_protein_processed.pdb --pdb_path_chains A
+    """
 
     import json, time, os, sys, glob
     import shutil
