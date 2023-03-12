@@ -1,12 +1,15 @@
+#!/usr/bin/env python3
 import argparse
 import os.path
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 def main(args):
     import json, time, os, sys, glob
     import shutil
     import warnings
     import numpy as np
-    import torch
     from torch import optim
     from torch.utils.data import DataLoader
     import queue
@@ -19,6 +22,15 @@ def main(args):
     from concurrent.futures import ProcessPoolExecutor    
     from utils import worker_init_fn, get_pdbs, loader_pdb, build_training_clusters, PDB_dataset, StructureDataset, StructureLoader
     from model_utils import featurize, loss_smoothed, loss_nll, get_std_opt, ProteinMPNN
+    import wandb
+    from collections import defaultdict
+
+    if args.log_to_wandb:
+        wandb.init(
+            project="ProteinMPNN",
+            entity='benf549',
+            config=dict(vars(args))
+        )
 
     scaler = torch.cuda.amp.GradScaler()
      
@@ -65,15 +77,13 @@ def main(args):
         args.max_protein_length = 1000
         args.batch_size = 1000
 
+    print('building clusters...')
     train, valid, test = build_training_clusters(params, args.debug)
      
     train_set = PDB_dataset(list(train.keys()), loader_pdb, train, params)
     train_loader = torch.utils.data.DataLoader(train_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
     valid_set = PDB_dataset(list(valid.keys()), loader_pdb, valid, params)
     valid_loader = torch.utils.data.DataLoader(valid_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
-    
-    print(args.hidden_dim, args.num_encoder_layers, args.num_neighbors, args.dropout, args.backbone_noise)
-    raise NotImplementedError
 
     model = ProteinMPNN(node_features=args.hidden_dim, 
                         edge_features=args.hidden_dim, 
@@ -117,6 +127,7 @@ def main(args):
         loader_train = StructureLoader(dataset_train, batch_size=args.batch_size)
         loader_valid = StructureLoader(dataset_valid, batch_size=args.batch_size)
         
+        print('entering training loop:')
         reload_c = 0 
         for e in range(args.num_epochs):
             t0 = time.time()
@@ -171,6 +182,7 @@ def main(args):
                 train_weights += torch.sum(mask_for_loss).cpu().data.numpy()
 
                 total_step += 1
+                break
 
             model.eval()
             with torch.no_grad():
@@ -203,7 +215,10 @@ def main(args):
             with open(logfile, 'a') as f:
                 f.write(f'epoch: {e+1}, step: {total_step}, time: {dt}, train: {train_perplexity_}, valid: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}\n')
             print(f'epoch: {e+1}, step: {total_step}, time: {dt}, train: {train_perplexity_}, valid: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}')
-            
+
+            if args.log_to_wandb:
+                wandb.log({'epoch': e+1, 'step': total_step, 'train perplexity': train_perplexity, 'valid perplexity': validation_perplexity, 'train_acc': train_accuracy, 'valid_acc': validation_accuracy})
+           
             checkpoint_filename_last = base_folder+'model_weights/epoch_last.pt'.format(e+1, total_step)
             torch.save({
                         'epoch': e+1,
@@ -224,12 +239,58 @@ def main(args):
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.optimizer.state_dict(),
                         }, checkpoint_filename)
+            if (e % 5) == 0:
+                with torch.no_grad():
+                    confusion_dict = defaultdict(lambda: torch.zeros(20))
+                    num_bb, num_correct = 0, 0
+                    for _, batch in enumerate(loader_valid):
+                        X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all = featurize(batch, device)
+                        randn_1 = torch.randn(chain_M.shape, device=X.device)
 
+                        omit_AAs_list = ['X']
+                        alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
+                        omit_AAs_np = np.array([AA in omit_AAs_list for AA in alphabet]).astype(np.float32)
+                        bias_AAs_np = np.zeros(len(alphabet))
+
+                        sample_dict = model.sample(X, randn_1, S, chain_M, residue_idx, chain_encoding_all, mask=mask, chain_M_pos=chain_M, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, temperature=1e-6)
+                        mask_for_loss = mask*chain_M
+
+                        for batch_idx in range(mask_for_loss.shape[0]):
+                            curr_mask = mask_for_loss[batch_idx].bool()
+
+                            predictions = sample_dict['S'][batch_idx][curr_mask]
+                            num_correct += (S[batch_idx][curr_mask] == predictions).sum().item()
+                            num_bb += S[batch_idx][curr_mask].shape[0]
+
+                            predictions = F.one_hot(predictions, num_classes=20).cpu()
+                            for idx, i in enumerate(S[batch_idx][curr_mask].tolist()):
+                                confusion_dict[i] += predictions[idx]
+
+                    sampled_accuracy = num_correct / num_bb
+                    print(sampled_accuracy)
+                    if args.log_to_wandb:
+                        valid_conf_mtx = [wandb.Image(plot_confusion_matrix(confusion_dict), caption='valid data set amino acid preds')]
+                        plt.close()
+                        wandb.log({'sampled valid confusion matrix': valid_conf_mtx, 'sampled_valid_accuracy': sampled_accuracy})
+
+def plot_confusion_matrix(confusion_counts):
+    alphabet = 'ACDEFGHIKLMNPQRSTVWY'
+
+    # Generate confusion matrix by normalizing and stacking each row.
+    data_mtx = torch.stack([confusion_counts[x] / torch.sum(confusion_counts[x]).item() for x in range(20)])
+    sns.heatmap(data_mtx, cmap='YlGnBu', vmax=0.5)
+    ax = plt.gca()
+    ax.set_title('Sampled Test Dataset Confusion Matrix')
+    ax.set_xticklabels([alphabet[x] for x in range(20)])
+    ax.set_yticklabels([alphabet[x] for x in range(20)]);
+    ax.set_xlabel('Predicted Amino Acid')
+    ax.set_ylabel('True Amino Acid')
+    return plt.gcf()
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    argparser.add_argument("--path_for_training_data", type=str, default="my_path/pdb_2021aug02", help="path for loading training data") 
+    argparser.add_argument("--path_for_training_data", type=str, default="../../single_atom_vdM_gnn/pdb_2021aug02", help="path for loading training data") 
     argparser.add_argument("--path_for_outputs", type=str, default="./exp_020", help="path for logs and model weights")
     argparser.add_argument("--previous_checkpoint", type=str, default="", help="path for previous model weights, e.g. file.pt")
     argparser.add_argument("--num_epochs", type=int, default=200, help="number of epochs to train for")
@@ -248,6 +309,8 @@ if __name__ == "__main__":
     argparser.add_argument("--debug", type=bool, default=False, help="minimal data loading for debugging")
     argparser.add_argument("--gradient_norm", type=float, default=-1.0, help="clip gradient norm, set to negative to omit clipping")
     argparser.add_argument("--mixed_precision", type=bool, default=True, help="train with mixed precision")
+
+    argparser.add_argument('--log_to_wandb', type=bool, default=False, help='log data into weights and biases.')
  
     args = argparser.parse_args()    
     main(args)   
